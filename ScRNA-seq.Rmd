@@ -1,0 +1,1014 @@
+---
+title: "ScRNA-Seq_Analysis"
+author: "Irene Majer"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+In this project i will perform the Single Cell RNA-Seq analysis on **Hypothalamus** from Mus musculus. I retrived the data from [PanglaoDB](https://panglaodb.se/view_data.php?sra=SRA694785&srs=SRS3214438).
+
+> The hypothalamus is the region in the ventral brain which coordinates the endocrine system. It receives many signals from various regions of the brain and in return, releases both releasing and inhibiting hormones, which then act on the pituitary gland to direct the functions of the thyroid gland, adrenal glands, and reproductive organs and to influence growth, fluid balance, and milk production. It is also involved in the non-endocrine functions of temperature regulation, regulation of the autonomic nervous system, and the control of appetite. -- Physiology, Hypothalamus. Zainab Shahid; Edinen Asuka; Gurdeep Singh.
+
+The data used for this project are 5265 cells from the hypothalamus of mus musculus. The approach that was used to perform scRNA-seq is 10x Genomics Chromium. According to PanglaoDB the cell types present in this samples are:
+
+-   Astrocytes n=183
+
+-   Endothelial cells n=128
+
+-   Macrophages n=20
+
+-   Microglia n=152
+
+-   Neurons n=3241
+
+-   Oligodendrocyte progenitor cells n=239
+
+-   Oligodendrocytes n=950
+
+-   Smooth muscle cells n=91
+
+The aim of my analysis is to characterize each of the cell types identified in PanglaoDB.
+
+In the literature -- [Molecular, Spatial and Functional Single-Cell Profiling of the Hypothalamic Preoptic Region](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6482113/) - they found:
+
+-   Astrocytes
+
+-   Endothelial cell
+
+-   Epidemyal
+
+-   Neuron
+
+-   Fibroblast
+
+-   Oligodendrocyte progenitor cells
+
+-   Mature Oligodendrocyte
+
+-   Macrophage
+
+-   Microglia
+
+-   Mural (Smooth muscle cells)
+
+-   Newly formed Oligodendrocyte
+
+The differences are in the presence of different type of Oligodendrocyte, presence of Fibroblast and epidemyal cells.
+
+The aim of this analysis is to predict as much as possible the correct cell type in the sample.
+
+### Library used in the analysis
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(viridis)
+library(ggplot2)
+library(tidyverse) 
+library(clustree)
+```
+
+## Loading dataset
+
+Note that gene are saved such ase gene name + EnseblID, so I truncate the part of the ID to get just the name of the genes:
+
+```{r warning=FALSE}
+Hypodata <- load('./SRA694785_SRS3214438.sparse.RData')
+head(rownames(sm))
+
+rownames(sm) <- sapply(strsplit(rownames(sm),"_"), `[`, 1)
+
+ht <- CreateSeuratObject(counts = sm, project = "Hypothalamus", min.cells = 3, min.features = 200)
+ht
+```
+
+## Quality control
+
+Before do any analysis I want to check some quality parameter and filtering the "problematic cells":
+
+-   The distribution of the number of detected genes per cell -\> `nFeature_RNA` the number of observed genes (anything with a nonzero count). Low-quality cells or empty droplets will often have very few genes while cell doublets or multiplets exhibit an aberrantly high gene count
+
+-   The distribution of the number of reads per cell -\> `nCount_RNA` the total number of reads (or more correctly UMIs) in the dataset
+
+-   The distribution of the % of mitochondrial reads -\> `percent.mt`
+
+-   The amount of ribosomal protein genes -\> `percent.rbp`
+
+Note that in this dataset more then 10k of cells are present, while in Panglao only 5k are reported. The first step is to cut the samples with less the 1k count reads:
+
+```{r}
+ht <- subset(ht, subset = nCount_RNA > 1000)
+ht
+
+```
+
+### Amount of mitochondrial genes
+
+The percentage of reads that map to the mitochondrial genome indicates low-quality or dying cells. In this particular case the cells often exhibit extensive mitochondrial contamination. To do this I call the `PercentageFeatureSet()` function, which calculates the percentage of counts originating from a set of features. In this case the symbol is mt-:
+
+```{r}
+grep("^mt-",rownames(ht),value = TRUE)
+ht[["percent.mt"]] <- PercentageFeatureSet(ht, pattern = "^mt-")
+```
+
+❗ Regular expressions are case sensitive, check on your dataset if you have to use capital letter or not
+
+### Amount of ribosomal protein genes
+
+Ribosomal genes also tend to be very highly represented, and can vary between cell types, so it can be instructive to see how prevalent they are in the data. These are ribosomal protein genes rather than the actual rRNA, so they're more a measure of the translational activity of the cell rather than the cleanliness of the polyA selection. Their gene symbol usually starts by RPL or RPS:
+
+```{r}
+grep("^Rp[ls]",rownames(ht),value = TRUE)
+ht[["percent.rbp"]] <- PercentageFeatureSet(ht, pattern = "^Rp[ls]")
+```
+
+### Visualization of QC plot
+
+Now I want to visualize the quality parameter presented above.
+
+```{r}
+VlnPlot(ht, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.rbp"), col='#0099FF', ncol = 4)
+```
+
+Not so clear with points...
+
+```{r}
+VlnPlot(ht, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.rbp"),col='#0099FF', ncol = 4, pt.size=0)
+
+```
+
+The number of genes transcribed in each cell is between (more or less) 200 and 6000. Remember that:
+
+-   Low-quality cells or empty droplets will often have very few genes
+
+-   Cell doublets or multiplets may exhibit an aberrantly high gene count
+
+So I will have to filter for outlier in each sense.
+
+The Number of reads is between 0 and 20000, also in this case is important to consider that:
+
+-   Cells with too few reads, corresponding to possible empty droplets
+
+-   Cells with too many reads, corresponding to possible doublets (two cells or more inside the same droplet)
+
+The % of mitochondrial genes are quite low for the majority of the samples, and this is also true for the % of ribosomal protein genes (\<30%). I can conclude that the data are quite good.
+
+### Metrics against each others
+
+I'm interested in the possible relationship between parameters, maybe there is some sort of correlation. To do this i use the `FeatureScatter` function of Seurat or use `ggplot` to obtain a better (from a visual point of view) result:
+
+```{r}
+as_tibble(
+  ht[[]],
+  rownames="Cell.Barcode"
+) -> qc.metrics
+
+head(qc.metrics)
+```
+
+The correlation showed in `FeatureScatter` function is just the Pearson correlation between the two variables that we are passing:
+
+```{r}
+correlationFeatureCount <- cor(qc.metrics$nCount_RNA, qc.metrics$nFeature_RNA)
+
+qc.metrics %>%
+  ggplot(aes(nCount_RNA,nFeature_RNA,colour=percent.mt)) + 
+  geom_point() + 
+  geom_hline(yintercept = 700) +
+  geom_hline(yintercept = 5500) +
+  scale_color_gradientn(colors=viridis(5)) +
+  geom_text(
+    aes(label = paste("Corr:", round(correlationFeatureCount, 2))),
+    x = -Inf,
+    y = Inf,
+    hjust = 0,
+    vjust = 1,
+    size = 4,
+    family = "Arial",
+    colour = "black",
+  )
+```
+
+I want to plot with the log transformation to have a better idea
+
+```{r}
+qc.metrics %>%
+  arrange(percent.mt) %>%
+  ggplot(aes(nCount_RNA,nFeature_RNA,colour=percent.mt)) + 
+  geom_point(size=0.7) + 
+  scale_color_gradientn(colors=viridis(5)) +
+  geom_hline(yintercept = 700) +
+  geom_hline(yintercept = 5500) +
+  scale_x_log10() + scale_y_log10()
+```
+
+I can do the same thing to check for possible correlation between `nCount_RNA` and `percent.mt`:
+
+```{r}
+correlationFCountMT <- cor(qc.metrics$nCount_RNA, qc.metrics$percent.mt)
+
+qc.metrics %>%
+  ggplot(aes(nCount_RNA,percent.mt,colour=percent.mt)) + 
+  geom_point() + 
+  scale_color_gradientn(colors=viridis(5)) +
+  geom_text(
+    aes(label = paste("Corr:", round(correlationFCountMT, 2))),
+    x = Inf,
+    y = Inf,
+    hjust = 1,
+    vjust = 1,
+    size = 4,
+    family = "Arial",
+    colour = "black",
+  )
+```
+
+An the last things to check is correlation between `nCount_RNA` and `percent.rbp`:
+
+```{r}
+correlationCountRBP <- cor(qc.metrics$nCount_RNA, qc.metrics$percent.rbp)
+
+qc.metrics %>%
+  ggplot(aes(nCount_RNA,percent.rbp,colour=percent.rbp)) + 
+  geom_point() + 
+  scale_color_gradientn(colors=viridis(5)) +
+  geom_text(
+    aes(label = paste("Corr:", round(correlationCountRBP, 2))),
+    x = Inf,
+    y = Inf,
+    hjust = 1,
+    vjust = 1,
+    size = 4,
+    family = "Arial",
+    colour = "black",
+  )
+```
+
+I can conclude that the only visible correlation is between the number of reads and the number of genes detected -\> there are potentially a couple of different populations seen here with different relationships between the read (UMI) counts and number of genes detected. When they are too low, the droplet was empty -\> correspond to the data points in the bottom left quadrant of the plot (1). If they are too high, probably a doublet. On the basis of these plot, we have to decide thresholds for cell quality control.
+
+## Defining a threshold
+
+Before deciding the thresholds I want to go a little deeper into the analysis using other plots:
+
+```{r}
+qc.metrics %>%
+  ggplot(aes(percent.mt)) + 
+  geom_histogram(binwidth = 0.5, fill = '#0099FF', colour = "black") +
+  ggtitle("Distribution of Percentage Mitochondrion") +
+  geom_vline(xintercept = 10)
+```
+
+On the basis of the previous analysis I can decide to remove the outliers using some filters:
+
+-   Cells that have unique feature counts over 5500 or less than 1000
+
+-   Cells that have \>5% mitochondrial counts
+
+Anyway I can change this thresholds and repeat the analysis, it depends from the final result. I find this article very useful for deciding cutoff:
+
+> -   Perform QC by finding outlier peaks in the number of genes, the count depth and the fraction of mitochondrial reads. Consider these covariates jointly instead of separately.
+>
+> -   Be as permissive of QC thresholding as possible, and revisit QC if downstream clustering cannot be interpreted.
+>
+> -   If the distribution of QC covariates differ between samples, QC thresholds should be determined separately for each sample to account for sample quality differences as in Plasschaert *et al*
+
+```{r}
+ht <- subset(ht, subset = nFeature_RNA > 700 & nFeature_RNA < 5500 & percent.mt < 10)
+ht
+```
+
+I have eliminated 422 cells and this is ok. I plot again the first graph with the new dataset:
+
+```{r}
+as_tibble(
+  ht[[]],
+  rownames="Cell.Barcode"
+) -> qc.metrics_new
+
+correlationFeatureCount <- cor(qc.metrics_new$nCount_RNA, qc.metrics_new$nFeature_RNA)
+
+qc.metrics_new %>%
+  ggplot(aes(nCount_RNA,nFeature_RNA,colour=percent.mt)) + 
+  geom_point() + 
+  scale_color_gradientn(colors=viridis(5)) +
+  geom_text(
+    aes(label = paste("Corr:", round(correlationFeatureCount, 2))),
+    x = -Inf,
+    y = Inf,
+    hjust = 0,
+    vjust = 1,
+    size = 4,
+    family = "Arial",
+    colour = "black",
+  )
+```
+
+## Normalization
+
+Normalization is useful because systematic variations are adjusted to **make expression counts comparable across genes and/or samples**.
+
+The default normalization in Seurat is pretty simple - it simply scales the counts by the total counts in each cell, multiplies by 10,000 and then log transforms. This because the aim of this type of analysis is to understand what makes the the difference in how a gene changes its expression across the cells, rather than its actual expression values. `LogNormalize` that normalizes the feature expression measurements for each cell by the total expression, multiplies this by a scale factor (10,000 by default), and log-transforms the result.
+
+```{r}
+ht <- NormalizeData(ht, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+Note that in Seurat the original counts are visible with `ht@assays$RNA@counts` and also the normalized ones with `ht@assays$RNA@data` .
+
+Now is possible to retrieve the list of of the most highly expressed genes overall.
+
+```{r}
+apply(ht@assays$RNA@data,1,mean) -> gene.expression
+
+sort(gene.expression, decreasing = TRUE) -> gene.expression
+
+head(gene.expression, n=50)
+```
+
+The first gene is Malat1, a nuclear expressed transcript very common in the final phase of cell cycle. It also expressed anyway, but in high level could be indicative of a problem. There are also a lot of ribosomal proteins and mitochondrial RNA.
+
+This is the violin plot of Malat1 and another housekeeping gene:
+
+```{r}
+VlnPlot(ht, features = c("Malat1","Actb"), col="#0099FF" )
+```
+
+### Cell cycle scoring
+
+In this type of analysis we are considering single cells, not a "bulk" of cells. One of the things that we will notice is that if the cells are cycling, their expression profile will be "dominated" by the cell cycle phase (M or S) they are in. Seurat comes with a bunch of marker genes for different cell cycle stages which we can use, such as `cc.genes.updated.2019`. In the site I couldn't find a more updated version...
+
+```{r}
+cc.genes.updated.2019
+```
+
+Now I can use it to try to predict the cell cycle of each cell:
+
+```{r warning=FALSE}
+CellCycleScoring(ht, s.features = cc.genes.updated.2019$s.genes, g2m.features = cc.genes.updated.2019$g2m.genes, set.ident = TRUE) -> ht
+
+ht[[]]
+```
+
+Below the plot representing the spread of the cells in different states:
+
+```{r}
+as_tibble(ht[[]]) %>%
+  ggplot(aes(Phase)) + geom_bar(fill = c("#99CCFF", "#0099FF", "#003399"))
+```
+
+## Gene selection
+
+Each cell is a point in a n-dimensional space, where n is the number of genes considered. The closer two points, the more similar are the transcriptomes of the corresponding cells. However, the dimensions are too many for further processing. Also, most of the coordinates of each cell will be zero. So, the choice is to keep a subset of the genes, that is, those with the greatest variability of expression across cells. Those are the ones that make the difference from one cell type to the other.
+
+Seurat provides a method to calculate a normalized intensity for each gene, and can then select the top 'n' most variable features. The default method -vst- computes (or better, estimates) the mean-variance relationship of each gene, and chooses the 2000 genes with the highest variance.
+
+```{r message=FALSE}
+ht <- FindVariableFeatures(ht, selection.method = "vst", nfeatures = 2000)
+```
+
+In this way we have reduced the total space in a 2000-dimensional one, filtering for genes mentioned above.
+
+Identify the 10 most highly variable genes
+
+```{r warning=FALSE}
+top10 <- head(VariableFeatures(ht), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(ht, cols = c("#BFD3E6","#003399"))
+plot2 <- LabelPoints(plot = plot1, points = top10, xnudge = 0, ynudge = 0, repel = TRUE)
+plot1 + plot2
+```
+
+And the plot of the variance vs mean and highlight the selected genes:
+
+```{r}
+as_tibble(HVFInfo(ht),rownames = "Gene") -> variance.ht
+
+variance.ht %>% 
+  mutate(hypervariable=Gene %in% VariableFeatures(ht)
+) -> variance.ht
+
+variance.ht %>% 
+  ggplot(aes(log(mean),log(variance),color=hypervariable)) + 
+  geom_point() + 
+  scale_color_manual(values=c("#BFD3E6","#003399"))
+```
+
+## Scaling the data
+
+Before proceeding another scaling of the counts is advised. The idea is to shift the expression of each gene, so that the mean expression across cells is 0 and the variance across cells is 1.\
+This step gives equal weight in downstream analyses, so that highly-expressed genes do not dominate. In practice, values are sort of "binarized", or rather "ternarized":
+
+-   \>0 -\> "high expression"
+
+-   0 "average expression"
+
+-   \<0 "under expression, or no expression at all".
+
+Notice that this is done for all the genes - not only the most variable ones.
+
+```{r}
+all.genes <- rownames(ht)
+ht <- ScaleData(ht, features = all.genes)
+```
+
+## Dimensional reduction
+
+The recommended method for 10x data is PCA. Notice that it is performed on the "variable features" only (the 2000 most variable genes), not on all the genes.
+
+Principal Component Analysis (PCA) is a technique used to emphasize variation as well as similarity, and to bring out strong patterns in a dataset; it is one of the methods used for *"dimensionality reduction"*.\
+Also notice: the variable genes are identified considering the log(x+1) of counts, while the PCA is performed after data have been scaled as explained above.
+
+Dimensionality reduction has two goals:
+
+-   Making data representable for human eye inspection (i.e. in a two-dimensional space)
+
+-   Making data treatable for downstream analyses (i.e. in a lower dimensional space, e.g. 10- or 20-dimensional space).
+
+We use PCA that chooses axes in the high-dimensional space that capture the largest amount of variation, and projects points along those axes:
+
+-   The first axis (or principal component) is chosen such that it captures the greatest variance across cells. Variance is meant as the overall variance of the cells coordinates projected on the axis.
+
+-   The next PC is chosen such as it is orthogonal to the first and captures the greatest remaining amount of variation and so on
+
+```{r}
+ht <- RunPCA(ht, features = VariableFeatures(object = ht))
+print(ht[["pca"]], dims = 1:2, nfeatures = 10)
+```
+
+Now plot the most variable genes on the first two PCs:
+
+```{r}
+VizDimLoadings(ht, dims = 1:2, reduction = "pca", col="#0099FF")
+```
+
+And the projection of the cells in the first two principal components:
+
+```{r}
+DimPlot(ht, reduction = "pca", cols = c("#BFD3E6", "#0099FF", "#003399"))
+```
+
+The cells don't seem to group according to the cell cycle phase so the cell cycle factor doesn't need to be removed.
+
+### Choose the number of PCs
+
+The next step is to decide how far down the set of PCs do we need to go to capture all of the biologically relevant information. Elbow plot shows the amount of variance captured in the different PC.
+
+```{r}
+ElbowPlot(ht)
+```
+
+Looking at the plot the right number seems to be 12 but I need to consider different choices. Note that the use of the elbow point tends to retain fewer PCs compared to other methods, see [here](http://bioconductor.org/books/3.13/OSCA.advanced/dimensionality-reduction-redux.html#more-choices-for-the-number-of-pcs).
+
+There are three main approaches to consider in order to choose the right number of PCs
+
+1.  Exploring genes changing in each of the PCs to determine relevant sources of heterogeneity, and could be used in conjunction with GSEA for example
+
+2.  Jackstraw -\> implements a statistical test based on a random null model, but is time-consuming for large datasets, and may not return a clear PC cutoff.
+
+3.  Heuristic test is commonly used, and can be calculated instantly.
+
+Note that performing downstream analyses with only 5 PCs does significantly and adversely affect results. On the other hand, too many PCs can introduce noise and split cells by technical variation only:
+
+-   High number pf PCs -\> more biological signal but also more noise that might mask biological signal
+
+-   Low number of PCs -\> introduce competition between different sources of variation, but weaker factors may be discarded
+
+### Using the technical noise
+
+Another very effective rule of thumb is to keep all the PC until 70-75% of the variance is explained:
+
+```{r}
+pc.touse <- (ht$pca@stdev)^2
+pc.touse <- pc.touse/sum(pc.touse)
+pc.touse <- cumsum(pc.touse)[1:50]
+pc.touse <- min(which(pc.touse>=0.75))
+pc.touse
+```
+
+The dimensionality of the output represents the lower bound on the number of PCs required to retain all biological variation. See the [OSCA advanced](http://bioconductor.org/books/3.13/OSCA.advanced/) for more details.
+
+## Clustering
+
+Clustering is an unsupervised learning procedure that is used to empirically define groups of cells with similar expression profiles to describe population heterogeneity in terms of discrete labels that are easily understood.
+
+The central issue is determining the correct number of clusters in which partition the cell → the clusters that best captures the biology of the experiment.
+
+Seurat first constructs a kNN graph based on the euclidean distance in PCA space, and refines the edge weights between any two cells based on the shared overlap in their local neighborhoods (Jaccard similarity). This step is performed using the `FindNeighbors()` function, and takes as input the previously defined dimensionality of the dataset (first 11 PCs). By default, the "k" of kNN is set to 20.
+
+```{r}
+ht <- FindNeighbors(ht, dims = 1:10)
+```
+
+To cluster the cells, modularity optimization techniques such as the Louvain algorithm (default) are applied to iteratively group cells together, with the goal of optimizing the standard modularity function.
+
+The `FindClusters()` function implements this procedure, and contains a resolution parameter that sets the 'granularity' of the downstream clustering, with increased values leading to a greater number of clusters. Seurat authors find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets.
+
+Since my dataset is about 4k i will try to plot different resolution to find the optimal one using clustree
+
+```{r}
+compare_cluster <- ht
+resolutions <- c(0, 0.2, 0.5, 0.9)
+compare_cluster <- FindClusters(compare_cluster, resolution = resolutions)
+```
+
+I initialize the compare_cluster object with different values for resolution (I suggest to add 0 to have clearer result). And you can also specify a range for resolution. Anyway, here is the [vignette](https://cran.r-project.org/web/packages/clustree/vignettes/clustree.html#seurat-objects) of clustree example.
+
+```{r}
+head(compare_cluster[[]])
+clustree(compare_cluster, prefix = "RNA_snn_res.")
+```
+
+As you can see there are not huge change. Even if Seurat authors find that setting this parameter between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells, I found that for my 4k cells i can use different resolution.
+
+I think that resolution 0.2 is the best one and I find 9 communities:
+
+The clusters can be found using the `Idents()` function, or in the field "seurat_clusters" of the pbmc object.
+
+```{r}
+ht <- FindClusters(ht, resolution = 0.2)
+```
+
+The ht object contains the information about the cluster to which each cell is associated:
+
+```{r}
+head(Idents(ht), 5)
+head(ht[[]],5)
+```
+
+The resolution of clustering thus becomes dependent on the density of cells, which can occasionally be misleading if it overstates the heterogeneity in the data.
+
+### PCs
+
+Now I can plot the result in the space of the first two PCs but in practice, you have to try different combinations of PCA dimensions and resolution, until you are satisfied by the results.
+
+```{r}
+DimPlot(ht, reduction = "pca")
+```
+
+Look at other PCs:
+
+```{r}
+DimPlot(ht,reduction="pca", dims=c(1,4))
+```
+
+Some clusters start to separate and these differences represent a small proportion of the overall variance but can be important in resolving changes. Some cluster seems to have less cell then others, as mentioned also by PanglaoDB
+
+```{r}
+for (i in 0:8)
+{print (paste('Cluster', i, 'has', length(Idents(ht)[Idents(ht) == i]), 'cells'))}
+```
+
+### TSNE
+
+Till now cells are represented as points in a 2D space. PCA works well by keeping the top d PCs, but plotting only the first two PCs often does not provide a meaningful (for a human observer) visualization.
+
+The *de facto* standard for visualization of scRNA-seq data is the t-stochastic neighbor embedding (t-SNE) method (Van der Maaten and Hinton [2008](#0)). TSNE aims to find a low-dimensional representation of the data that preserves the distances between each point and its neighbors in the high-dimensional space.
+
+```{r}
+ht <- RunTSNE(ht, dims=1:10)
+DimPlot(ht, reduction = "tsne")
+```
+
+Here cluster are well separated compared to the previous plot. But you can see that it is much more computationally intensive than other visualization methods.
+
+### UMAP
+
+The uniform manifold approximation and projection (UMAP) method (McInnes, Healy, and Melville [2018](http://bioconductor.org/books/3.13/OSCA.basic/dimensionality-reduction.html#ref-mcInnes2018umap)) is an alternative to t-SNE for non-linear dimensionality reduction.
+
+This method produces more compact visual clusters with more empty space between them. It also attempts to preserve more of the global structure (distance) among clusters.
+
+UMAP is much faster, it is increasingly displacing t-SNE as the method of choice for visualizing large scRNA-seq data sets.
+
+```{r}
+ht <- RunUMAP(ht, dims = 1:10)
+DimPlot(ht, reduction = "umap")
+```
+
+Seems that there is a big cluster (in the right of the plot). I will have to analyze the clusters in there to understand if they are different or not.
+
+### Number of reads
+
+It's a good practice to analyze if the clusters are influenced by any of the QC metrics.
+
+```{r}
+VlnPlot(ht,features="nCount_RNA")
+```
+
+### Number of genes
+
+```{r}
+VlnPlot(ht,features="nFeature_RNA")
+```
+
+### **Percent Mitochondrion**
+
+```{r}
+VlnPlot(ht,features="percent.mt")
+```
+
+### Percent ribosomal protein genes
+
+```{r}
+VlnPlot(ht,features="percent.rbp")
+```
+
+### Cell cycle
+
+```{r}
+ht@meta.data %>%
+  group_by(seurat_clusters,Phase) %>%
+  count() %>%
+  group_by(seurat_clusters) %>%
+  mutate(percent=100*n/sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x=seurat_clusters,y=percent, fill=Phase)) +
+  geom_col() +
+  ggtitle("Percentage of cell cycle phases per cluster") +
+  scale_fill_manual(values = c("#BFD3E6", "#0099FF", "#003399"))
+```
+
+The proportions of cells in the different cell cycle phases are quite the same in all the clusters.
+
+## Finding marker gene
+
+Seurat includes a function that can be used to find genes:
+
+-   Overexpressed between two clusters
+
+-   Overexpressed in one clusters with respect to all the others
+
+The function permits to employ different tests, including those used for bulk RNA-Seq. For 10x data, the choice is to employ a non parametric test (once again, the Wilcoxon test!) which is the default. Notice also another parameter (min.pct): it means that a gene has to be expressed in at least 25% of the cells of the cluster.
+
+### 1 vs the others
+
+```{r}
+cluster0.markers <- FindMarkers(ht, ident.1 = 0, min.pct = 0.25, test.use = "wilcox")
+head(cluster0.markers, n = 5)
+```
+
+Check for Ado genes
+
+```{r}
+VlnPlot(ht,features="Gprasp2")
+```
+
+Gprasp2 is present in cluster 0 and also in cluster 2, 3 and 4 -\> maybe are the same cell type?
+
+### Top 5 genes in 1 vs all
+
+The one vs. all analysis can be iterated automatically:
+
+Output of the top n (in this case 5)marker genes for each cluster. Notice that here they are sorted by logFC - more informative than "p_val_adj", since *a lot of* genes will have a FDR close to zero with smallest changes:
+
+```{r}
+ht.markers <- FindAllMarkers(ht, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+ht.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC)
+```
+
+### Cell type for each cluster
+
+The cell types are assigned manually with PanglaoDB, literatures and Human Gene Atlas:
+
+| Cluster | Markers | Cell type                       |
+|---------|---------|---------------------------------|
+| 0       | Calb2   | Neurons (inhibitory)            |
+| 1       | Plp1    | Oligodendrocytes                |
+| 2       | Arpp21  | Neurons (excitatory)            |
+| 3       | Avp     | Neurons (Inhibitory)            |
+| 4       | Ptprz1  | Oligodendrocyte progenitor cell |
+| 5       | Slc1a3  | Astrocytes                      |
+| 6       | Ccl4    | Microglia                       |
+| 7       | Itm2a   | Endothelial cells               |
+| 8       | Acta2   | Smooth muscle cells             |
+
+In general there are well separated cluster, it is necessary to do other analysis to decide to merge or not some clusters
+
+And now the list of the most upregulated gene for each cluster
+
+```{r}
+top_gene <- c('Calb2', 'Plp1', 'Arpp21', 'Avp', 'Ptprz1', 'Slc1a3', 'Ccl4', 'Itm2a', 'Acta2')
+```
+
+Violin Plot:
+
+```{r}
+VlnPlot(ht,features=top_gene)
+```
+
+For some cluster there is a gene that which can uniquely predict , but for many others we have a hit which also picks up other clusters.
+
+I want to visualize this also with a heatmap and other plot. Having two clusters with "too similar" patterns of DE/marker genes might be a problem. Can we conclude that after all they are the same cell type, partitioned wrongly into two separate clusters, or they are indeed two different cell types or subtypes, with a few genes "making the difference" from one another?
+
+```{r}
+FeaturePlot(ht, features = top_gene)
+```
+
+There are some evident similarities.
+
+Double check with a heatmap where the higher is the expression of a marker gene in a cell the more the color moves to yellow.
+
+```{r}
+ht.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+DoHeatmap(ht, features = top10$gene, cells = 1:500, size = 4,
+    angle = 90) + NoLegend()
+
+```
+
+Here I can observe that some clusters seem to share part of their over-expressed genes --- cluster 0 and 3 are quite similar, also 2 and 3.
+
+```{r}
+DotPlot(ht, features = top_gene)
+```
+
+### Further analysis
+
+Cluster-cluster comparisons might be useful in case the "one versus all" analysis returns some common genes for more than one cluster, or if at the end of the annotation we have two or more clusters attributed to the same cell type (i.e. to see whether "sub" types can be identified).
+
+#### Neurons
+
+Cluster 0, 2 and 3 are neurons. Now I can check if I can find some interesting subtype:
+
+```{r}
+clusterNeurons.markers <- FindMarkers(ht, ident.1 = c(0,2,3), min.pct = 0.25, test.use = "wilcox")
+clusterNeurons.markers <- clusterNeurons.markers[order(-clusterNeurons.markers$avg_log2FC), ] 
+head(clusterNeurons.markers, n = 20)
+```
+
+All neurons... Let's check for some subtypes:
+
+```{r}
+cluster0vs2and3.markers <- FindMarkers(ht, ident.1 = 0, ident.2 = c(2, 3), min.pct = 0.25, test.use = "wilcox") 
+cluster0vs2and3.markers <- cluster0vs2and3.markers[order(-cluster0vs2and3.markers$avg_log2FC),] 
+head(cluster0vs2and3.markers, n = 10)
+```
+
+```{r}
+cluster3.markers <- FindMarkers(ht, ident.1 = 3, ident.2 = c( 2, 0), min.pct = 0.25, test.use = "wilcox") 
+cluster3.markers <- cluster3.markers[order(-cluster3.markers$avg_log2FC),] 
+head(cluster3.markers, n = 10)
+```
+
+Avp is largely expressed in magnocellular neurosecretory neurons in hypothalamus (The Human Protein Atlas). So cluster 3 can be considered as a particular subtype
+
+From this i can conclude that neurons 0 and 3 are inhibitory while 2 is excitatory. In paritcular 3 is a subtype.
+
+```{r}
+Idents(ht)[Idents(ht) == 0] <- 3
+head(Idents(ht))
+```
+
+## Final result
+
+Those are the cell types:
+
+0.  Neurons (inhibitory)
+1.  Oligodendrocytes
+2.  Neurons (excitatory)
+3.  Magnocellular neurosecretory neurons
+4.  Oligodendrocyte progenitor cell
+5.  Astrocytes
+6.  Microglia
+7.  Endothelial cells
+8.  Smooth muscle cells
+
+```{r}
+new.cluster.ids <- c("Inhibitory Neurons","Oligodendrocytes", "Excitatory neurons", "Magnocellular neurosecretory neurons", "Oligodenrocytes progenitor cells", "Astrocytes","Microglia","Endothelial cells", "Smooth muscle cells")
+names(new.cluster.ids) <- levels(ht)
+ht <- RenameIdents(ht, new.cluster.ids)
+DimPlot(ht, reduction = "umap", label = TRUE, pt.size = 0.2) + NoLegend()
+```
+
+## Changing parameters
+
+So at the end of the first analysis I found more subtype then PanglaoDB, using the split between excitatory and inhibitory neurons as presented in the literature.
+
+I couldn't find all the type presented in PanglaoDB since I missed macrophages -\> NOTE: the real problem here is that the number of macrophages is 20, BUT 20 is also the number of k in KNN clustering. Anyway i will perform again the analysis with different parameters to show how the result changes.
+
+I couldn't find many type presented in the article (i.e fibroblast, newly formed oligodendrocyte, ependymial cells). The study in the article was performed over 6 mice and many more cell then mine, so I think that this is the reason of this discrepancy.
+
+Now i would like to perform again the analysis, changing some parameters in order to find more cell type.
+
+I would like to start with more permissive cutoff (sorry, i reload the data since i don't want to rewrite the previous results):
+
+```{r}
+ht_new <- CreateSeuratObject(counts = sm, project = "Hypothalamus", min.cells = 3, min.features = 200)
+ht_new <- subset(ht_new, subset = nCount_RNA > 1000)
+ht_new
+```
+
+The data are the same, so I go straight to the change of parameters:
+
+```{r}
+ht_new[["percent.mt"]] <- PercentageFeatureSet(ht_new, pattern = "^mt-")
+ht_new[["percent.rbp"]] <- PercentageFeatureSet(ht_new, pattern = "^Rp[ls]")
+ht_new <- subset(ht_new, subset = nFeature_RNA > 700 & nFeature_RNA < 5500 & percent.mt < 5)
+ht_new
+```
+
+Now I have to compute again the scaling
+
+```{r}
+ht_new <- NormalizeData(ht_new, normalization.method = "LogNormalize", scale.factor = 10000)
+
+CellCycleScoring(ht_new, s.features = cc.genes.updated.2019$s.genes, g2m.features = cc.genes.updated.2019$g2m.genes, set.ident = TRUE) -> ht_new
+
+as_tibble(ht_new[[]]) %>%
+  ggplot(aes(Phase)) + geom_bar(fill = c("#9EBCDA", "#8C96C6", "#8C6BB1"))
+```
+
+In this case there are a lot of cells in phase S with respect to the other two.
+
+The next steps are gene selection and scaling:
+
+```{r}
+ht_new <- FindVariableFeatures(ht_new, selection.method = "vst", nfeatures = 2000)
+
+as_tibble(ht_new[[]]) %>%
+  ggplot(aes(Phase)) + geom_bar(fill = c("#9EBCDA", "#8C96C6", "#8C6BB1"))
+as_tibble(HVFInfo(ht_new),rownames = "Gene") -> variance.ht_new
+
+variance.ht_new %>% 
+  mutate(hypervariable=Gene %in% VariableFeatures(ht_new)
+) -> variance.ht_new
+
+variance.ht_new %>% 
+  ggplot(aes(log(mean),log(variance),color=hypervariable)) + 
+  geom_point() + 
+  scale_color_manual(values=c("#BFD3E6","#6E016B"))
+
+all.genes <- rownames(ht_new)
+ht_new <- ScaleData(ht_new, features = all.genes)
+
+```
+
+Now perform PCA:
+
+```{r}
+ht_new <- RunPCA(ht_new, features = VariableFeatures(object = ht_new))
+
+ElbowPlot(ht_new)
+```
+
+Let's see if it is necessary to change the number of PCs:
+
+```{r}
+pc.touse_new <- (ht_new$pca@stdev)^2
+pc.touse_new <- pc.touse_new/sum(pc.touse_new)
+pc.touse_new <- cumsum(pc.touse_new)[1:50]
+pc.touse_new <- min(which(pc.touse_new>=0.75))
+pc.touse_new
+```
+
+10 seems a bit lower than i expected, so in this analysis i choose 15:
+
+```{r}
+ht_new <- FindNeighbors(ht_new, dims = 1:15)
+```
+
+Now I have to cluster, since my cells are about 4k I need to choose a higher number for resolution
+
+```{r}
+compare_cluster_new <- ht_new
+resolutions_new <- c(0, 0.2, 0.5, 0.9, 1.2, 1.5)
+compare_cluster_new <- FindClusters(compare_cluster_new, resolution = resolutions_new)
+clustree(compare_cluster_new, prefix = "RNA_snn_res.")
+```
+
+In the first analysis i chose 0.2 as resolution. In this tree I can see that 0.5 and 0.9 as values don't change so much:
+
+```{r}
+ht_new <- FindClusters(ht_new, resolution = 0.5)
+
+DimPlot(ht_new, reduction = "pca")
+
+ht_new <- RunTSNE(ht_new, dims=1:15)
+DimPlot(ht_new, reduction = "tsne")
+
+ht_new <- RunUMAP(ht_new, dims = 1:15)
+DimPlot(ht_new, reduction = "umap")
+
+ht.markers_new <- FindAllMarkers(ht_new, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+ht.markers_new %>%
+    group_by(cluster) %>%
+    slice_max(n = 5, order_by = avg_log2FC)
+```
+
+```{r}
+for (i in 0:17)
+{print (paste('Cluster', i, ': ', length(Idents(ht_new)[Idents(ht_new) == i]), 'cells'))}
+```
+
+### Cell Type
+
+Now i will proceed with the manual annotation:
+
+| Cluster | Markers           | Cell type                                                   |
+|-------------------|---------------------------|---------------------------|
+| 0       | Plp1, Trf         | Mature oligodendrocytes                                     |
+| 1       | Gal               | Neurons (Inhibitory) Galanine neurons                       |
+| 2       | Trh               | Neurons (Inhibitory) Trh neurons                            |
+| 3       | Arpp21            | Neurons(Excitatory)                                         |
+| 4       | Ptprz1, Seprpine2 | Oligodendrocyte progenitor cell                             |
+| 5       | Sst               | Neurons (Inhibitory) - Sst Neurons                          |
+| 6       | Meis2             | Neurons (Excitatory)                                        |
+| 7       | Avp               | Neurons (Inhibitory) - Magnocellular neurosecretory neurons |
+| 8       | Fos               | Neurons (Excitatory)                                        |
+| 9       | Slc1a3            | Astrocytes                                                  |
+| 10      | Ccl4              | Microglia                                                   |
+| 11      | Egr4              | Neurons (Excitatory)                                        |
+| 12      | Itm2a             | Endothelial cells                                           |
+| 13      | Acta2             | Smooth muscle cells                                         |
+| 14      | Sirt2             | Oligodendrocytes                                            |
+| 15      | Opalin            | Oligodendrocytes                                            |
+| 16      | Lyz2              | Macrophages                                                 |
+| 17      | Sln               | Neurons (Excitatory)                                        |
+
+Thr Neurons -\> through neurons in the anterior hypothalamic-preoptic area that coordinate a variety of autonomic responses; arousal and locomotor activation through cholinergic and dopaminergic mechanisms on the septum and nucleus accumbens, respectively; and regulation of the cephalic phase of digestion. [Here the article](https://pubmed.ncbi.nlm.nih.gov/16876577/).
+
+### New clusters
+
+```{r}
+Idents(ht_new)[Idents(ht_new) == 3] <- 6
+head(Idents(ht_new))
+Idents(ht_new)[Idents(ht_new) == 6] <- 8
+head(Idents(ht_new))
+Idents(ht_new)[Idents(ht_new) == 8] <- 11
+head(Idents(ht_new))
+Idents(ht_new)[Idents(ht_new) == 11] <- 17
+head(Idents(ht_new))
+
+```
+
+```{r}
+Idents(ht_new)[Idents(ht_new) == 14] <- 15
+head(Idents(ht_new))
+
+```
+
+```{r}
+new.ids <- c("Mature Oligodendrocytes","Neurons (Inhibitory) - Galanine neurons", "Neurons (Inhibitory) Trh neurons", "Oligodendrocyte progenitor cell", "Neurons (Inhibitory) - Sst Neurons", "Neurons (Inhibitory) - Magnocellular neurosecretory neurons", "Astrocytes","Microglia","Endothelial cells", "Smooth muscle cells", "Oligodendrocytes", "Macrophages", "Neuron (Excitatory)")
+names(new.ids) <- levels(ht_new)
+ht_new <- RenameIdents(ht_new, new.ids)
+DimPlot(ht_new, reduction = "umap", dims = c(1,2), label = TRUE, label.size=3, pt.size = 0.2) + NoLegend()
+```
+
+## Appendix: Automated cell type annotation
+
+SingleR is an automatic annotation method for single-cell RNA sequencing (scRNAseq) data (Aran et al. 2019).
+
+Celldex comes with a collection of reference data sets -\> mouse.rnaseq is a brain specific reference (RNASeq-based) for mouse, but there are also dataset for human. You can find everything [here](http://www.bioconductor.org/packages/devel/data/experiment/vignettes/celldex/inst/doc/userguide.html)
+
+The first step is to convert the Seurat object to single cell experiment (SCE) for convenience (SingleR works on this type of object):
+
+```{r message=FALSE, warning=FALSE}
+library(SingleCellExperiment)
+sceHT <- as.SingleCellExperiment(DietSeurat(ht))
+```
+
+```{r message=FALSE, warning=FALSE}
+library(celldex)
+library(SingleR)
+ref.mouse <- celldex::MouseRNAseqData(ensembl = FALSE, cell.ont = 'nonna')
+
+
+pred.ht <- SingleR(test = sceHT, ref = ref.mouse, assay.type.test=1,
+                   labels = ref.mouse$label.main)
+
+table(pred.ht$labels)
+```
+
+And now I add the annotations to the Seurat object metadata and visualize
+
+```{r}
+newHT <- ht
+newHT@meta.data$pred.ht <- pred.ht$pruned.labels
+newHT <- SetIdent(newHT, value = "pred.ht")
+DimPlot(newHT, label = T , repel = T, label.size = 3) + NoLegend()
+```
+
+The tool found more type then my first analysis but without the various subtypes. Now I will try again with the fine label of the mouse dataset:
+
+```{r}
+fine.ht <- SingleR(test = sceHT, ref = ref.mouse, assay.type.test=1,
+                   labels = ref.mouse$label.fine)
+table(fine.ht$labels)
+fineHT <- ht
+fineHT@meta.data$fine.ht <- fine.ht$pruned.labels
+fineHT <- SetIdent(fineHT, value = "fine.ht")
+DimPlot(fineHT, label = T , repel = T, label.size = 3) + NoLegend()
+```
+
+Now there are a lot of new subtype of cells. Nothing for neurons but a lot of similarity with respect to the article.
